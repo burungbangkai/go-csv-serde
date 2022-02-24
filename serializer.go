@@ -184,10 +184,10 @@ func getValueSerializer(typ reflect.Type, val reflect.Value, opts SerializerOpti
 	if _, ok := val.Interface().(encoding.TextMarshaler); ok {
 		return defaultVTextMarshaller
 	}
-	fmt.Println(typ.Kind())
-	fmt.Printf("t %T\n", val.Interface())
 	var vser vserializer
 	switch typ.Kind() {
+	case reflect.Interface, reflect.Func, reflect.Chan:
+		return nil
 	case reflect.Ptr:
 		typ = typ.Elem()
 		vser = getValueSerializer(typ, val, opts)
@@ -247,6 +247,9 @@ func populateFields(any interface{}, tagName string, opts SerializerOptions) []s
 			ftyp = fval.Type()
 		}
 		vser := getValueSerializer(ftyp, fval, opts)
+		if vser == nil {
+			continue
+		}
 		info := serinfo{
 			Name:       name,
 			Fn:         vser,
@@ -336,7 +339,11 @@ var defaultVserializer = func(v reflect.Value) string {
 	if !v.IsValid() {
 		return ""
 	}
-	return fmt.Sprintf("%v", v.Interface())
+	any := v.Interface()
+	if any == nil {
+		return ""
+	}
+	return fmt.Sprint()
 }
 
 var boolVserializer = func(v reflect.Value) string {
