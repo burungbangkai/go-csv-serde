@@ -12,68 +12,81 @@ import (
 	"time"
 )
 
-type SerializationError struct {
-}
-
-func (se SerializationError) Error() string {
-	return ""
+var strBuilders = sync.Pool{
+	New: func() interface{} {
+		return &strings.Builder{}
+	},
 }
 
 type ser struct {
-	opts  SerializerOptions
+	opts  serializerOptions
 	infos []serinfo
 	typ   reflect.Type
 }
 
-type Result func() ([]string, error)
+// SerResult is function that returns the result of the serialization
+// this is a work around because channel can only have one type
+type SerResult func() ([]string, error)
 type Stop func() error
 
 type Serializer interface {
-	Start(ctx context.Context, useHeader bool) (chan<- interface{}, <-chan Result, Stop)
+	// Start starts the serializer. it will return 2 channel and a stopper function.
+	// the first channel is where the client send the input,
+	// the second channel is whhere the serializaion result will be sent.
+	// when client does not have any other data to push to the input channel,
+	// it must call the stopper function to stop the serializer goroutine cleanly and prevent memory leak.
+	Start(ctx context.Context, produceHeader bool) (input chan<- interface{}, result <-chan SerResult, stopper Stop)
 }
 
-type SerializerOptions struct {
-	delimiter      rune
-	quote          rune
-	tagName        string
-	bufferSize     int
-	timeSerializer vserializer
+type serializerOptions struct {
+	delimiter            rune
+	quote                rune
+	tagName              string
+	bufferSize           int
+	sliceOrArrayEncloser [2]rune
 }
 
-type SerializerOption func(*SerializerOptions)
+type SerializerOption func(*serializerOptions)
 
 func WithDelimiter(delimiter rune) SerializerOption {
-	return func(opts *SerializerOptions) {
+	return func(opts *serializerOptions) {
 		opts.delimiter = delimiter
 	}
 }
 
 func WithQuote(quote rune) SerializerOption {
-	return func(opts *SerializerOptions) {
+	return func(opts *serializerOptions) {
 		opts.quote = quote
 	}
 }
 
 func WithTagName(tag string) SerializerOption {
-	return func(opts *SerializerOptions) {
+	return func(opts *serializerOptions) {
 		opts.tagName = tag
 	}
 }
 
 func WithBufferSize(size int) SerializerOption {
-	return func(opts *SerializerOptions) {
+	return func(opts *serializerOptions) {
 		if size > 0 {
 			opts.bufferSize = size
 		}
 	}
 }
 
+func WithSliceOrArrayEncloser(encloser [2]rune) SerializerOption {
+	return func(opts *serializerOptions) {
+		opts.sliceOrArrayEncloser = encloser
+	}
+}
+
 func NewSerializer(theType interface{}, opts ...SerializerOption) (Serializer, error) {
 	s := &ser{}
-	sops := SerializerOptions{
-		quote:      '"',
-		tagName:    "csv",
-		bufferSize: 10,
+	sops := serializerOptions{
+		tagName:              "csv",
+		bufferSize:           10,
+		delimiter:            ',',
+		sliceOrArrayEncloser: [2]rune{'[', ']'},
 	}
 	for _, opt := range opts {
 		opt(&sops)
@@ -83,40 +96,50 @@ func NewSerializer(theType interface{}, opts ...SerializerOption) (Serializer, e
 		return nil, err
 	}
 	s.typ = reflect.TypeOf(theType)
-	s.infos = populateFields(theType, sops.tagName, sops)
+	s.infos = populateFields(theType, sops)
 	return s, nil
 }
 
 type vserializer func(reflect.Value) string
 
-func (s *ser) Start(ctx context.Context, useHeader bool) (chan<- interface{}, <-chan Result, Stop) {
+func (s *ser) Start(ctx context.Context, produceHeader bool) (chan<- interface{}, <-chan SerResult, Stop) {
 	ch := make(chan interface{}, s.opts.bufferSize)
-	res := make(chan Result, s.opts.bufferSize)
+	res := make(chan SerResult, s.opts.bufferSize)
 	infos := s.infos
+	once := &sync.Once{}
+	stop := func() error {
+		once.Do(func() {
+			close(ch)
+		})
+		return nil
+	}
 	go func() {
+		headerOnce := &sync.Once{}
 		for {
 			select {
 			case <-ctx.Done():
 				res <- func() ([]string, error) {
 					return nil, ctx.Err()
 				}
-				close(res)
+				_ = stop()
 				return
 			case val, chOpen := <-ch:
 				if !chOpen {
 					close(res)
 					return
 				}
-				if useHeader {
-					useHeader = false
-					res <- func() ([]string, error) {
-						header := make([]string, 0, len(infos))
-						for _, info := range infos {
-							header = append(header, info.Name)
+				headerOnce.Do(func() {
+					if produceHeader {
+						res <- func() ([]string, error) {
+							header := make([]string, 0, len(infos))
+							for _, info := range infos {
+								header = append(header, info.Name)
+							}
+							return header, nil
 						}
-						return header, nil
 					}
-				}
+				})
+
 				valTyp := reflect.TypeOf(val)
 				if valTyp != s.typ {
 					res <- func() ([]string, error) {
@@ -125,24 +148,17 @@ func (s *ser) Start(ctx context.Context, useHeader bool) (chan<- interface{}, <-
 					continue
 				}
 				res <- func() ([]string, error) {
-					values := make([]string, 0, len(infos))
+					values := make([]string, len(infos))
 					v := reflect.ValueOf(val)
-					for _, info := range infos {
+					for idx, info := range infos {
 						fv := getByFieldIndex(v, info.FieldIndex)
-						values = append(values, info.Fn(fv))
+						values[idx] = info.Fn(fv)
 					}
 					return values, nil
 				}
 			}
 		}
 	}()
-	once := &sync.Once{}
-	stop := func() error {
-		once.Do(func() {
-			close(ch)
-		})
-		return nil
-	}
 	return ch, res, stop
 }
 
@@ -152,7 +168,7 @@ type serinfo struct {
 	Fn         vserializer
 }
 
-// we use this
+// we use this because reflect.Value.FieldByIndex() will panic if the underlying value is nil
 func getByFieldIndex(v reflect.Value, index []int) reflect.Value {
 	for _, x := range index {
 		if v.Kind() == reflect.Ptr {
@@ -180,7 +196,7 @@ func validateInterfaceInput(inf interface{}) error {
 	return nil
 }
 
-func getValueSerializer(typ reflect.Type, val reflect.Value, opts SerializerOptions) vserializer {
+func getValueSerializer(typ reflect.Type, val reflect.Value, opts serializerOptions) vserializer {
 	if _, ok := val.Interface().(encoding.TextMarshaler); ok {
 		return defaultVTextMarshaller
 	}
@@ -190,6 +206,7 @@ func getValueSerializer(typ reflect.Type, val reflect.Value, opts SerializerOpti
 		return nil
 	case reflect.Ptr:
 		typ = typ.Elem()
+		val = reflect.New(typ)
 		vser = getValueSerializer(typ, val, opts)
 	case reflect.Bool:
 		vser = boolVserializer
@@ -208,15 +225,19 @@ func getValueSerializer(typ reflect.Type, val reflect.Value, opts SerializerOpti
 	case reflect.String:
 		vser = stringVseralizer
 	case reflect.Slice, reflect.Array:
-		ivser := getValueSerializer(typ.Elem(), val, opts)
-		vser = createSliceVseralizer(ivser, opts.quote)
+		typ = typ.Elem()
+		val = reflect.New(typ)
+		evser := getValueSerializer(typ, val, opts)
+		vser = createSliceVseralizer(evser, opts)
+	case reflect.Struct:
+		vser = createStructVseralizer(typ, opts)
 	default:
 		vser = defaultVserializer
 	}
 	return vser
 }
 
-func populateFields(any interface{}, tagName string, opts SerializerOptions) []serinfo {
+func populateFields(any interface{}, opts serializerOptions) []serinfo {
 	typ := reflect.TypeOf(any)
 	val := reflect.ValueOf(any)
 	infos := make([]serinfo, 0, typ.NumField())
@@ -229,13 +250,14 @@ func populateFields(any interface{}, tagName string, opts SerializerOptions) []s
 			continue
 		}
 		name := f.Name
-		if tagName != "" {
-			str := f.Tag.Get(tagName)
+		if opts.tagName != "" {
+			str := f.Tag.Get(opts.tagName)
 			if str == "" || str == "-" {
 				continue
 			}
 			name = str
 		}
+		// iterate until we get the thing that the pointer points to
 		for fval.Kind() == reflect.Ptr {
 			if fval.IsNil() {
 				if fval.Type().Elem().Kind() != reflect.Struct {
@@ -250,20 +272,36 @@ func populateFields(any interface{}, tagName string, opts SerializerOptions) []s
 		if vser == nil {
 			continue
 		}
+		// using string build is much faster than using regular string concatenation
+		sb := strBuilders.Get().(*strings.Builder)
+		sb.WriteRune(opts.quote)
+		sb.WriteString(name)
+		sb.WriteRune(opts.quote)
 		info := serinfo{
-			Name:       name,
+			Name:       sb.String(),
 			Fn:         vser,
 			FieldIndex: f.Index,
 		}
+		sb.Reset()
+		strBuilders.Put(sb)
 		infos = append(infos, info)
 		if fval.Kind() == reflect.Struct {
 			if _, ok := fval.Interface().(encoding.TextMarshaler); ok {
 				continue
 			}
 			infos = infos[:len(infos)-1]
-			iinfos := populateFields(fval.Interface(), tagName, opts)
+			iinfos := populateFields(fval.Interface(), opts)
 			for _, iinfo := range iinfos {
-				iinfo.Name = name + "." + iinfo.Name
+				sb = strBuilders.Get().(*strings.Builder)
+				sb.WriteRune(opts.quote)
+				iinfo.Name = strings.ReplaceAll(iinfo.Name, string(opts.quote), "")
+				sb.WriteString(name)
+				sb.WriteRune('.')
+				sb.WriteString(iinfo.Name)
+				sb.WriteRune(opts.quote)
+				iinfo.Name = sb.String()
+				sb.Reset()
+				strBuilders.Put(sb)
 				iinfo.FieldIndex = append(f.Index, iinfo.FieldIndex...)
 				infos = append(infos, iinfo)
 			}
@@ -271,6 +309,27 @@ func populateFields(any interface{}, tagName string, opts SerializerOptions) []s
 
 	}
 	return infos
+}
+
+func createStructVseralizer(typ reflect.Type, opts serializerOptions) vserializer {
+	inf := reflect.New(typ).Elem().Interface()
+	infos := populateFields(inf, opts)
+	return func(v reflect.Value) string {
+		sb := strBuilders.Get().(*strings.Builder)
+		defer func() {
+			sb.Reset()
+			strBuilders.Put(sb)
+		}()
+		sb.WriteRune(opts.quote)
+		for _, info := range infos {
+			val := getByFieldIndex(v, info.FieldIndex)
+			str := info.Fn(val)
+			sb.WriteString(str)
+			sb.WriteRune(opts.delimiter)
+		}
+		sb.WriteRune(opts.quote)
+		return sb.String()
+	}
 }
 
 var defaultVTextMarshaller = func(v reflect.Value) string {
@@ -288,28 +347,34 @@ var defaultVTextMarshaller = func(v reflect.Value) string {
 	return string(b)
 }
 
-func createSliceVseralizer(elemvser vserializer, quote rune) vserializer {
+func createSliceVseralizer(elemvser vserializer, opts serializerOptions) vserializer {
 	return func(v reflect.Value) string {
 		for v.Kind() == reflect.Ptr {
 			if v.IsNil() {
-				empty := []rune{quote, quote}
+				empty := []rune{opts.quote, opts.quote}
 				return string(empty)
 			}
 			v = v.Elem()
 		}
 		if !v.IsValid() {
-			empty := []rune{quote, quote}
+			empty := []rune{opts.quote, opts.quote}
 			return string(empty)
 		}
-		sb := strings.Builder{}
-		sb.WriteRune(quote)
+		sb := strBuilders.Get().(*strings.Builder)
+		defer func() {
+			sb.Reset()
+			strBuilders.Put(sb)
+		}()
+		sb.WriteRune(opts.quote)
+		sb.WriteRune('[')
 		for i := 0; i < v.Len(); i++ {
 			sb.WriteString(elemvser(v.Index(i)))
 			if i < v.Len()-1 {
-				sb.WriteString(",")
+				sb.WriteRune(opts.delimiter)
 			}
 		}
-		sb.WriteRune(quote)
+		sb.WriteRune(']')
+		sb.WriteRune(opts.quote)
 		return sb.String()
 	}
 }
@@ -343,7 +408,7 @@ var defaultVserializer = func(v reflect.Value) string {
 	if any == nil {
 		return ""
 	}
-	return fmt.Sprint()
+	return fmt.Sprintf("%v", any)
 }
 
 var boolVserializer = func(v reflect.Value) string {
