@@ -19,7 +19,7 @@ var strBuilders = sync.Pool{
 }
 
 type ser struct {
-	opts  serializerOptions
+	opts  options
 	infos []serinfo
 	typ   reflect.Type
 }
@@ -38,51 +38,11 @@ type Serializer interface {
 	Start(ctx context.Context, produceHeader bool) (input chan<- interface{}, result <-chan SerResult, stopper Stop)
 }
 
-type serializerOptions struct {
-	delimiter            rune
-	quote                rune
-	tagName              string
-	bufferSize           int
-	sliceOrArrayEncloser [2]rune
-}
+var _ Serializer = (*ser)(nil)
 
-type SerializerOption func(*serializerOptions)
-
-func WithDelimiter(delimiter rune) SerializerOption {
-	return func(opts *serializerOptions) {
-		opts.delimiter = delimiter
-	}
-}
-
-func WithQuote(quote rune) SerializerOption {
-	return func(opts *serializerOptions) {
-		opts.quote = quote
-	}
-}
-
-func WithTagName(tag string) SerializerOption {
-	return func(opts *serializerOptions) {
-		opts.tagName = tag
-	}
-}
-
-func WithBufferSize(size int) SerializerOption {
-	return func(opts *serializerOptions) {
-		if size > 0 {
-			opts.bufferSize = size
-		}
-	}
-}
-
-func WithSliceOrArrayEncloser(encloser [2]rune) SerializerOption {
-	return func(opts *serializerOptions) {
-		opts.sliceOrArrayEncloser = encloser
-	}
-}
-
-func NewSerializer(theType interface{}, opts ...SerializerOption) (Serializer, error) {
+func NewSerializer(theType interface{}, opts ...SerdeOption) (Serializer, error) {
 	s := &ser{}
-	sops := serializerOptions{
+	sops := options{
 		tagName:              "csv",
 		bufferSize:           10,
 		delimiter:            ',',
@@ -196,7 +156,7 @@ func validateInterfaceInput(inf interface{}) error {
 	return nil
 }
 
-func getValueSerializer(typ reflect.Type, val reflect.Value, opts serializerOptions) vserializer {
+func getValueSerializer(typ reflect.Type, val reflect.Value, opts options) vserializer {
 	if _, ok := val.Interface().(encoding.TextMarshaler); ok {
 		return defaultVTextMarshaller
 	}
@@ -237,7 +197,7 @@ func getValueSerializer(typ reflect.Type, val reflect.Value, opts serializerOpti
 	return vser
 }
 
-func populateFields(any interface{}, opts serializerOptions) []serinfo {
+func populateFields(any interface{}, opts options) []serinfo {
 	typ := reflect.TypeOf(any)
 	val := reflect.ValueOf(any)
 	infos := make([]serinfo, 0, typ.NumField())
@@ -311,7 +271,7 @@ func populateFields(any interface{}, opts serializerOptions) []serinfo {
 	return infos
 }
 
-func createStructVseralizer(typ reflect.Type, opts serializerOptions) vserializer {
+func createStructVseralizer(typ reflect.Type, opts options) vserializer {
 	inf := reflect.New(typ).Elem().Interface()
 	infos := populateFields(inf, opts)
 	return func(v reflect.Value) string {
@@ -347,7 +307,7 @@ var defaultVTextMarshaller = func(v reflect.Value) string {
 	return string(b)
 }
 
-func createSliceVseralizer(elemvser vserializer, opts serializerOptions) vserializer {
+func createSliceVseralizer(elemvser vserializer, opts options) vserializer {
 	return func(v reflect.Value) string {
 		for v.Kind() == reflect.Ptr {
 			if v.IsNil() {

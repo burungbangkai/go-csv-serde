@@ -45,7 +45,7 @@ type F struct {
 
 func TestPopulateFields(t *testing.T) {
 	tt := T{}
-	infos := populateFields(tt, serializerOptions{})
+	infos := populateFields(tt, options{})
 	for _, v := range infos {
 		t.Logf("name: %s, index: %v, fn: %v", v.Name, v.FieldIndex, v.Fn)
 	}
@@ -264,7 +264,7 @@ func BenchmarkCSVReflection(b *testing.B) {
 }
 
 type handWritten struct {
-	opts serializerOptions
+	opts options
 }
 
 var _ Serializer = (*handWritten)(nil)
